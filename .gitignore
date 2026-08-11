@@ -16,3 +16,7 @@ Analysis_Noteboooks
 Grads
 *.png
 *.jpg
+Weights/**/*.tar
+Weights/**/__pycache__
+Weights
+Tmp
