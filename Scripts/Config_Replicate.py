@@ -204,15 +204,7 @@ if learned_features:
 downsampler = functools.partial(networks.PoolLayer,layer = nn.AvgPool2d, resize_ratio = (2,2))
 
 
-# propogater = networks.UNet(input_shape = input_shape,
-#                         output_size = label_values_train.input_size,
-#                         hidden_node_sizes = (500, 800, 1200, 1800),
-#                         dilations = (1, 2, 4, 8, 8),
-#                         downsampler = downsampler,
-#                         batch_norm = True,
-#                         batch_norm_function = networks.DynamicTanhScaled,
-#                         checkpoints = True,
-#                        )
+
 
 propogater = networks.UNext(input_shape = input_shape,
                 output_size = label_values_train.input_size,
@@ -223,24 +215,13 @@ propogater = networks.UNext(input_shape = input_shape,
                 residual_final = True,
                 final_conv_layer = True,
                 batch_norm = True,
-                # batch_norm_function = torch.nn.InstanceNorm2d,
                 batch_norm_function = networks.DynamicTanhScaled,
                 downsampler = downsampler,
                 checkpoints = True,
                 surya_blocks = True,
                        )
-# propogater = networks.ResNet(input_shape = input_shape,
-#                 output_size = label_values_train.input_size,
-#                 hidden_node_sizes = (300, 300, 300, 300, 300, 300, 300),
-#                 dilations = 1,
-#                 activate_final = True,
-#                 checkpoints = True,
-#                 batch_norm = True,
-#                 batch_norm_function = networks.DynamicTanhScaled,                             
-#                        )
 
 
-# args['network'] = networks.initialize_weights(propogater, init_func=functools.partial(nn.init.kaiming_normal_,nonlinearity='relu'))
 
 if learned_features:
     network = networks.FeatureWrapper(network=propogater,features=learned_features)
@@ -249,64 +230,6 @@ else:
     
 network =  nn.SyncBatchNorm.convert_sync_batchnorm(network)
 
-# path_propagator = '/pscratch/sd/a/asubel/Chapter_2/Networks/CM4_Pretrain_Fixed_Actually_2026-01-18/Checkpoints/Checkpoint_epoch_144.tar'
-
-# restart_config = torch.load(path_propagator, weights_only=True,map_location = 'cpu')
-# network.load_state_dict(restart_config['network_state'])
-
-# def configure_trainable_blocks(model: torch.nn.Module, 
-#                                unfreeze_down_blocks: int = 0, 
-#                                unfreeze_up_blocks: int = 0, 
-#                                unfreeze_final_layer: bool = True):
-#     """
-#     Freezes the entire model and then selectively unfreezes specific blocks based on location.
-    
-#     Args:
-#         model: The UNext model instance.
-#         unfreeze_down_blocks (int): Number of encoder blocks to unfreeze starting from the INPUT.
-#                                     (e.g., 1 = unfreeze down_layers[0]).
-#         unfreeze_up_blocks (int): Number of decoder blocks to unfreeze starting from the OUTPUT.
-#                                   (e.g., 1 = unfreeze up_layers[-1]).
-#         unfreeze_final_layer (bool): Whether to unfreeze the final 1x1 convolution layer.
-#     """
-    
-#     # 1. Efficiently freeze the entire model first
-#     # .requires_grad_(False) is an in-place PyTorch method that applies recursively
-#     model.requires_grad_(False)
-
-#     # 2. Unfreeze Down Layers (From Input -> Inward)
-#     # Slicing [:N] gets the first N items (0, 1, ..., N-1)
-#     if unfreeze_down_blocks > 0:
-#         for layer in model.down_layers[:unfreeze_down_blocks]:
-#             layer.requires_grad_(True)
-
-#     # 3. Unfreeze Up Layers (From Output -> Inward)
-#     # Slicing [-N:] gets the last N items
-#     if unfreeze_up_blocks > 0:
-#         for layer in model.up_layers[-unfreeze_up_blocks:]:
-#             layer.requires_grad_(True)
-            
-#     # 4. Unfreeze Final Convolution (if it exists and is requested)
-#     if unfreeze_final_layer and getattr(model, 'final_conv_layer', False):
-#         model.final_layer.requires_grad_(True)
-
-#     # Optional: Print summary
-#     total_params = sum(p.numel() for p in model.parameters())
-#     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-#     print(f"Model configured: {trainable_params:,} trainable parameters out of {total_params:,} total.")
-
-# # --- Usage Example ---
-
-# # This configuration trains:
-# # 1. The input block (perhaps to adapt to new input variables?)
-# # 2. The last 2 upsampling blocks (to adapt features to the output)
-# # 3. The final projection layer
-# configure_trainable_blocks(
-#     network, 
-#     unfreeze_down_blocks=0, 
-#     unfreeze_up_blocks=3, 
-#     unfreeze_final_layer=True
-# )
 
 
 
@@ -321,28 +244,6 @@ normalization_dt = transformations.inv_normalize(mean_dt,std_dt)
 dt_transformation = transformations.transformation([normalization_dt, wet_transformation])
 
 
-# local_smoothing_transformation = transformations.LocalSmoothing(channels = integrated_values_train.input_size,
-#                                                            stencil_size = 5,
-#                                                            wet_mask = wet_transformation_integrate.mask
-#                                                           )
-
-
-# diff_op = transformations.LaplacianDiffusion(channels=label_values_train.input_size,
-#                                       diffusion_coeff=0.05,
-#                                       wet_mask=wet_transformation_label.mask ,
-#                                       device_name='cpu')
-
-# forward_model = time_steppers.RK3StepDiffusion(
-#     diffusion_module=diff_op,
-#     network=network,
-#     dt=1,
-#     transform=dt_transformation,
-# )
-
-
-# forward_model = time_steppers.EulerStep(network = network,
-#                                         dt = 1,
-#                                         transform = dt_transformation)
 forward_model = time_steppers.DirectStep(network = network, dt = 1, transform = wet_transformation)
 
 
@@ -379,26 +280,12 @@ dynamic_level_scaling = losses.DynamicLevelScalingMultistep(label_values=label_v
                                         relaxation_period = 250,
                                         world_size = args["World_Size"],
                                         max_ratio = 10000,                   
-                                        # rand_threshold = .5,
                                         )
-# dynamic_level_scaling = losses.DynamicLevelScalingMultistep(label_values=label_values_train,
-#                                         post_weighting=area_weighting,
-#                                         inv_max_vals=None,
-#                                         max_steps = args['steps'][-1], 
-#                                         relaxation_period = 250,
-#                                         world_size = args["World_Size"],
-#                                         max_ratio = 100,    
-#                                         sqrt = True
-#                                         # rand_threshold = .5,    
-#                                         )
 
-# dynamic_level_scaling.level_weights = copy.deepcopy(restart_config['dynamic_weights'])
 
-area_weighting_true = losses.AreaWeight(data)
-total_weighting_mse = losses.ComposedWeight((area_weighting,dynamic_level_scaling))
 
-# mse_loss = losses.MSELoss(post_weighting=total_weighting_mse)
-mse_loss = losses.MSELoss(post_weighting=total_weighting_mse)
+
+mse_loss = losses.MSELoss(post_weighting=dynamic_level_scaling)
 
 mean_loss = losses.MeanLoss(wet_transform = wet_transformation,
                             area_weighting=area_weighting_true,
