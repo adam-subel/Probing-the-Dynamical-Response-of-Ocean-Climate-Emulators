@@ -1,15 +1,11 @@
-"""Put the CESM2 1pctCO2 ocean output on the emulator grid (Section 2.1).
-
-Identical to Process_CESM2_piControl.py apart from the experiment and its length.
-The 1% CO2 run is not used for training or for any response experiment; it appears
-only as the out-of-distribution reference in Figure 1, panels D and E.
-
+"""
 Usage:
     python Process_CESM2_1pctCO2.py init      # allocate the output store
     python Process_CESM2_1pctCO2.py 0 1800    # fill those time steps
 """
 
 import sys
+import time
 from itertools import pairwise
 
 import dask.array
@@ -21,8 +17,27 @@ import xesmf as xe
 
 # ------------------------------------------------------------------ configuration ---
 EXPERIMENT = "1pctCO2"
-VARIABLES = ["thetao", "so", "hfds", "uo", "vo", "tauuo", "tauvo"]
+
+# thetao must stay first: it is the dataset the others are merged into, and it carries
+# the `lev_bnds` the vertical operator needs.
+REQUIRED_VARIABLES = ["thetao", "so", "hfds", "tauuo", "tauvo"]
+OPTIONAL_VARIABLES = ["uo", "vo"]      # written when published, skipped when not
 SURFACE_VARIABLES = ["hfds", "tauuo", "tauvo"]
+
+CATALOG_URL = "https://cmip6.storage.googleapis.com/pangeo-cmip6.csv"
+SOURCE_ID = "CESM2"
+GRID_LABEL = "gn"
+PREFERRED_MEMBER = "r1i1p1f1"
+
+# `variable_id` alone is ambiguous -- tas is in Amon/day/3hr, thetao in Omon and Oyr.
+TABLE_IDS = {
+    "thetao": "Omon", "so": "Omon", "uo": "Omon", "vo": "Omon",
+    "hfds": "Omon", "tauuo": "Omon", "tauvo": "Omon",
+    "areacello": "Ofx", "deptho": "Ofx",
+}
+# The native grid is the same in every CESM2 experiment, so the time-invariant Ofx
+# fields can be taken from another experiment when they are not published for this one.
+GRID_EXPERIMENTS = [EXPERIMENT, "piControl", "historical"]
 
 PATH_TARGET_GRID = "/pscratch/sd/a/asubel/Data/CM2x_grids/gaussian_grid_180_by_360.nc"
 PATH_OUT = "/pscratch/sd/a/asubel/Data/Chapter_2/CESM2_1pctCO2_remade.zarr"
@@ -34,6 +49,94 @@ TARGET_LEVEL_BOUNDS = np.array([0, 5, 15, 30, 50, 80, 130, 200, 300, 450, 650,
                                 900, 1200, 1600, 2100, 2700, 3500, 4500, 5500, 6750])
 TARGET_LEVEL_CENTERS = np.array([2.5, 10, 22.5, 40, 65, 105, 165, 250, 375,
                                  550, 775, 1050, 1400, 1850, 2400, 3100, 4000, 5000, 6000])
+
+
+# --------------------------------------------------------------- catalogue access ---
+def retry(action, description, attempts=4, delay=5):
+    """Run `action`, retrying transient cloud failures with a backing-off delay."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return action()
+        except Exception as error:                                  # noqa: BLE001
+            if attempt == attempts:
+                raise RuntimeError(f"{description} failed after {attempts} attempts") from error
+            print(f"  {description}: attempt {attempt} failed ({error!r}); "
+                  f"retrying in {delay}s", flush=True)
+            time.sleep(delay)
+            delay *= 2
+
+
+def load_catalog():
+    return retry(lambda: pd.read_csv(CATALOG_URL), "reading the Pangeo CMIP6 catalogue")
+
+
+def catalog_rows(df, variable, experiment, member=None):
+    """The catalogue rows for one variable, newest version first.
+
+    Same filter as the original `df.query`, plus the `table_id` for this variable and,
+    when asked, one ensemble member. Sorting by version makes `.values[0]` deterministic.
+    """
+    rows = df[(df.source_id == SOURCE_ID)
+              & (df.experiment_id == experiment)
+              & (df.variable_id == variable)
+              & (df.grid_label == GRID_LABEL)]
+    table_id = TABLE_IDS.get(variable)
+    if table_id is not None:
+        rows = rows[rows.table_id == table_id]
+    if member is not None:
+        rows = rows[rows.member_id == member]
+    return rows.sort_values("version", key=lambda column: column.astype(str), ascending=False)
+
+
+def pick_member(df):
+    """One ensemble member that publishes every required variable."""
+    available = {variable: set(catalog_rows(df, variable, EXPERIMENT).member_id)
+                 for variable in REQUIRED_VARIABLES}
+
+    missing = [variable for variable, members in available.items() if not members]
+    if missing:
+        raise RuntimeError(
+            f"{SOURCE_ID} {EXPERIMENT}: no catalogue entry for {', '.join(missing)} "
+            f"(grid_label {GRID_LABEL}, table "
+            f"{', '.join(sorted({TABLE_IDS[v] for v in missing}))})")
+
+    shared = set.intersection(*available.values())
+    if not shared:
+        summary = "; ".join(f"{v}: {sorted(m)}" for v, m in available.items())
+        raise RuntimeError(f"{SOURCE_ID} {EXPERIMENT}: no single member publishes all of "
+                           f"{REQUIRED_VARIABLES} -- {summary}")
+
+    return PREFERRED_MEMBER if PREFERRED_MEMBER in shared else sorted(shared)[0]
+
+
+def variable_store(df, variable, member):
+    """The zarr store for one time-varying variable, for the chosen member."""
+    rows = catalog_rows(df, variable, EXPERIMENT, member)
+    if rows.empty:
+        raise RuntimeError(f"{SOURCE_ID} {EXPERIMENT} {member}: no catalogue entry for "
+                           f"{variable} ({TABLE_IDS.get(variable, 'any table')}, "
+                           f"grid_label {GRID_LABEL})")
+    if len(rows) > 1:
+        print(f"  {variable}: {len(rows)} catalogue entries, taking version "
+              f"{rows.version.values[0]}")
+    return rows.zstore.values[0]
+
+
+def grid_store(df, variable):
+    """The zarr store for a time-invariant grid field, falling back across experiments."""
+    for experiment in dict.fromkeys(GRID_EXPERIMENTS):
+        rows = catalog_rows(df, variable, experiment)
+        if not rows.empty:
+            if experiment != EXPERIMENT:
+                print(f"  {variable}: not published for {EXPERIMENT}, taking it from "
+                      f"{experiment} (the native grid is identical across experiments)")
+            return rows.zstore.values[0]
+    raise RuntimeError(f"{SOURCE_ID}: no {variable} in the catalogue for any of "
+                       f"{GRID_EXPERIMENTS}")
+
+
+def open_store(zstore):
+    return retry(lambda: xr.open_zarr(fsspec.get_mapper(zstore)), f"opening {zstore}")
 
 
 # ------------------------------------------------------------------------ helpers ---
@@ -69,16 +172,21 @@ def horizontal_regrid(ds, ds_target, na_thres=0.5, coarse_wetmask=None):
 
 def load_source():
     """The native-grid CMIP6 fields, with the cell corners the regridder needs."""
-    df = pd.read_csv("https://cmip6.storage.googleapis.com/pangeo-cmip6.csv")
+    df = load_catalog()
+    member = pick_member(df)
+    print(f"{SOURCE_ID} {EXPERIMENT}: member {member}", flush=True)
 
-    def store(variable):
-        query = (f"experiment_id == '{EXPERIMENT}' & variable_id == '{variable}'"
-                 f" & grid_label == 'gn' & source_id == 'CESM2'")
-        return fsspec.get_mapper(df.query(query).zstore.values[0])
+    variables = list(REQUIRED_VARIABLES)
+    for variable in OPTIONAL_VARIABLES:
+        if catalog_rows(df, variable, EXPERIMENT, member).empty:
+            print(f"  {variable}: not published for {member}, leaving it out")
+        else:
+            variables.append(variable)
+    print(f"  variables: {', '.join(variables)}", flush=True)
 
     # Cell corners: CMIP bounds are per-cell, so the shared vertices are assembled by
     # taking corner 0 of every cell plus the outer edges of the last row and column.
-    area = xr.open_zarr(store("areacello")).rename({"nlat": "y", "nlon": "x"})
+    area = open_store(grid_store(df, "areacello")).rename({"nlat": "y", "nlon": "x"})
     vertex_shape = tuple(i + 1 for i in area.lat.shape)
     lon_b, lat_b = np.zeros(vertex_shape), np.zeros(vertex_shape)
     for bounds, corners in [(lon_b, area["lon_bnds"]), (lat_b, area["lat_bnds"])]:
@@ -87,11 +195,32 @@ def load_source():
         bounds[:-1, -1] = corners[:, -1, 1]
         bounds[-1, -1] = corners[-1, -1, 2]
 
-    data = xr.open_zarr(store(VARIABLES[0]))
-    for variable in VARIABLES[1:]:
-        data[variable] = xr.open_zarr(store(variable))[variable]
+    # thetao is the base dataset; the rest are merged into it. The time axes are compared
+    # first because a bare assignment would reindex a mismatched axis and fill with NaN.
+    data = open_store(variable_store(df, variables[0], member))
+    for variable in variables[1:]:
+        ds = open_store(variable_store(df, variable, member))
+        if not ds.time.equals(data.time):
+            raise RuntimeError(
+                f"{variable}: time axis does not match {variables[0]} "
+                f"({ds.time.size} steps, {ds.time.values[0]} to {ds.time.values[-1]} "
+                f"vs {data.time.size} steps, {data.time.values[0]} to "
+                f"{data.time.values[-1]})")
+        if ds[variable].sizes.get("nlat") != data.sizes["nlat"] \
+                or ds[variable].sizes.get("nlon") != data.sizes["nlon"]:
+            raise RuntimeError(f"{variable}: horizontal shape does not match {variables[0]}")
+        data[variable] = ds[variable]
+
+    if data.sizes["nlat"] != area.sizes["y"] or data.sizes["nlon"] != area.sizes["x"]:
+        raise RuntimeError("the areacello grid does not match the data grid: "
+                           f"{(area.sizes['y'], area.sizes['x'])} vs "
+                           f"{(data.sizes['nlat'], data.sizes['nlon'])}")
+    if data.time.size < N_MONTHS:
+        raise RuntimeError(f"{EXPERIMENT} has {data.time.size} months, "
+                           f"fewer than the {N_MONTHS} this script asks for")
+
     data = data.rename({"nlat": "y", "nlon": "x"})
-    data = data.drop_vars(["time_bnds", "lat_bnds", "lon_bnds"])
+    data = data.drop_vars(["time_bnds", "lat_bnds", "lon_bnds"], errors="ignore")
 
     data = data.assign_coords(
         wetmask=(["lev", "y", "x"], ((data["so"][0] * data["thetao"][0]) * 0 + 1).values))
