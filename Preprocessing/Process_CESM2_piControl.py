@@ -1,21 +1,12 @@
-"""Put the CESM2 piControl ocean output on the emulator grid (Section 2.1).
-
-Reads the CMIP6 piControl output from the Pangeo cloud catalogue, regrids it
-vertically from POP2's 60 levels onto the 19 target levels with a conservative
-overlap that allows partial cells, then regrids horizontally onto a 1 degree
-Gaussian grid with a conservative-normed xESMF regridder.
-
-The store this writes is the regridded output only. The figure notebooks read the
-`*_Detrended` store, which additionally removes the control drift from thetao, so and
-hfds; that step is not part of this script. Everything else -- uo, vo, tauuo, tauvo and
-the land mask -- is bit-identical between the two.
-
+"""
 Usage:
+    python Process_CESM2_piControl.py catalog   # list what the catalogue holds
     python Process_CESM2_piControl.py init      # allocate the output store
     python Process_CESM2_piControl.py 0 7200    # fill those time steps
 """
 
 import sys
+import time
 from itertools import pairwise
 
 import dask.array
@@ -25,16 +16,25 @@ import pandas as pd
 import xarray as xr
 import xesmf as xe
 
-# ------------------------------------------------------------------ configuration ---
 EXPERIMENT = "piControl"
-VARIABLES = ["thetao", "so", "hfds", "uo", "vo", "tauuo", "tauvo"]
+VARIABLES = ["thetao", "so", "hfds", "tauuo", "tauvo"]
 SURFACE_VARIABLES = ["hfds", "tauuo", "tauvo"]
+
+CATALOG_URL = "https://cmip6.storage.googleapis.com/pangeo-cmip6.csv"
+SOURCE_ID = "CESM2"
+GRID_LABEL = "gn"
+MEMBER_ID = "r1i1p1f1"
+TABLE_ID = "Omon"
+GRID_TABLE_ID = "Ofx"
+AREACELLO_EXPERIMENT = EXPERIMENT
+VERSION = "20190320"
+VERSIONS = {}
 
 PATH_TARGET_GRID = "/pscratch/sd/a/asubel/Data/CM2x_grids/gaussian_grid_180_by_360.nc"
 PATH_OUT = "/pscratch/sd/a/asubel/Data/Chapter_2/CESM2_piControl_Processed.zarr"
 
-N_MONTHS = 7200            # the last 600 years of the control
-SAMPLES_PER_STEP = 5       # time steps regridded per pass
+N_MONTHS = 7200
+SAMPLES_PER_STEP = 5
 
 TARGET_LEVEL_BOUNDS = np.array([0, 5, 15, 30, 50, 80, 130, 200, 300, 450, 650,
                                 900, 1200, 1600, 2100, 2700, 3500, 4500, 5500, 6750])
@@ -42,7 +42,80 @@ TARGET_LEVEL_CENTERS = np.array([2.5, 10, 22.5, 40, 65, 105, 165, 250, 375,
                                  550, 775, 1050, 1400, 1850, 2400, 3100, 4000, 5000, 6000])
 
 
-# ------------------------------------------------------------------------ helpers ---
+def retry(action, description, attempts=4, delay=5):
+    for attempt in range(1, attempts + 1):
+        try:
+            return action()
+        except Exception as error:
+            if attempt == attempts:
+                raise RuntimeError(f"{description} failed after {attempts} attempts") from error
+            print(f"  {description}: attempt {attempt} failed ({error!r}); "
+                  f"retrying in {delay}s", flush=True)
+            time.sleep(delay)
+            delay *= 2
+
+
+def load_catalog():
+    return retry(lambda: pd.read_csv(CATALOG_URL), "reading the Pangeo CMIP6 catalogue")
+
+
+def lookup(df, variable, experiment, table_id):
+    return df[(df.source_id == SOURCE_ID)
+              & (df.experiment_id == experiment)
+              & (df.member_id == MEMBER_ID)
+              & (df.table_id == table_id)
+              & (df.variable_id == variable)
+              & (df.grid_label == GRID_LABEL)]
+
+
+def resolve(df, variable, experiment=None, table_id=None):
+    experiment = EXPERIMENT if experiment is None else experiment
+    table_id = TABLE_ID if table_id is None else table_id
+    wanted = str(VERSIONS.get(variable, VERSION))
+
+    rows = lookup(df, variable, experiment, table_id)
+    label = f"{SOURCE_ID} {experiment} {MEMBER_ID} {table_id} {variable} {GRID_LABEL}"
+    if rows.empty:
+        raise RuntimeError(f"no catalogue entry for {label}")
+
+    versions = sorted(rows.version.astype(str).unique(), reverse=True)
+    if wanted not in versions:
+        raise RuntimeError(f"{label}: version {wanted} is not in the catalogue; it holds "
+                           f"{versions} -- add the right one to VERSIONS")
+
+    rows = rows[rows.version.astype(str) == wanted]
+    if len(rows) > 1:
+        raise RuntimeError(f"{label} v{wanted}: {len(rows)} rows match, expected one -- "
+                           f"{list(rows.zstore)}")
+    return rows.zstore.values[0], wanted
+
+
+def open_store(zstore):
+    return retry(lambda: xr.open_zarr(fsspec.get_mapper(zstore)), f"opening {zstore}")
+
+
+def print_catalog():
+    df = load_catalog()
+    wanted = [(variable, EXPERIMENT, TABLE_ID) for variable in VARIABLES]
+    wanted.append(("areacello", AREACELLO_EXPERIMENT, GRID_TABLE_ID))
+
+    print(f"\n{SOURCE_ID} {EXPERIMENT} {MEMBER_ID}, version {VERSION}"
+          + (f" with overrides {VERSIONS}" if VERSIONS else ""))
+    for variable, experiment, table_id in wanted:
+        rows = lookup(df, variable, experiment, table_id)
+        selected = str(VERSIONS.get(variable, VERSION))
+        if rows.empty:
+            print(f"  {variable:<10} NO ROWS for {experiment} {MEMBER_ID} {table_id} "
+                  f"{GRID_LABEL}")
+            continue
+        for version in sorted(rows.version.astype(str).unique(), reverse=True):
+            zstores = list(rows[rows.version.astype(str) == version].zstore)
+            marker = "->" if version == selected else "  "
+            print(f"  {marker} {variable:<10} v{version}  {' '.join(zstores)}")
+        if selected not in rows.version.astype(str).values:
+            print(f"     {variable:<10} v{selected} NOT PUBLISHED -- add it to VERSIONS")
+
+
 def horizontal_regrid(ds, ds_target, na_thres=0.5, coarse_wetmask=None):
     """Regrid `ds` horizontally, and conserve the integral in space"""
     regridder_kwargs = dict(ignore_degenerate=True, periodic=True, unmapped_to_nan=True)
@@ -61,7 +134,7 @@ def horizontal_regrid(ds, ds_target, na_thres=0.5, coarse_wetmask=None):
 
     lon, lat = ds_target.lon, ds_target.lat
     lon_b, lat_b = ds_target.lon_b, ds_target.lat_b
-    r_earth = 6356  # in km
+    r_earth = 6356
     new_area = xe.util.cell_area(ds_target, r_earth) * 1e6
 
     ds_regridded = ds_regridded.drop_vars(["lon_b", "lat_b"])
@@ -74,17 +147,12 @@ def horizontal_regrid(ds, ds_target, na_thres=0.5, coarse_wetmask=None):
 
 
 def load_source():
-    """The native-grid CMIP6 fields, with the cell corners the regridder needs."""
-    df = pd.read_csv("https://cmip6.storage.googleapis.com/pangeo-cmip6.csv")
+    df = load_catalog()
+    print(f"{SOURCE_ID} {EXPERIMENT} {MEMBER_ID} v{VERSION}: {', '.join(VARIABLES)}",
+          flush=True)
 
-    def store(variable):
-        query = (f"experiment_id == '{EXPERIMENT}' & variable_id == '{variable}'"
-                 f" & grid_label == 'gn' & source_id == 'CESM2'")
-        return fsspec.get_mapper(df.query(query).zstore.values[0])
-
-    # Cell corners: CMIP bounds are per-cell, so the shared vertices are assembled by
-    # taking corner 0 of every cell plus the outer edges of the last row and column.
-    area = xr.open_zarr(store("areacello")).rename({"nlat": "y", "nlon": "x"})
+    area_store, _ = resolve(df, "areacello", AREACELLO_EXPERIMENT, GRID_TABLE_ID)
+    area = open_store(area_store).rename({"nlat": "y", "nlon": "x"})
     vertex_shape = tuple(i + 1 for i in area.lat.shape)
     lon_b, lat_b = np.zeros(vertex_shape), np.zeros(vertex_shape)
     for bounds, corners in [(lon_b, area["lon_bnds"]), (lat_b, area["lat_bnds"])]:
@@ -93,11 +161,30 @@ def load_source():
         bounds[:-1, -1] = corners[:, -1, 1]
         bounds[-1, -1] = corners[-1, -1, 2]
 
-    data = xr.open_zarr(store(VARIABLES[0]))
+    data = open_store(resolve(df, VARIABLES[0])[0])
     for variable in VARIABLES[1:]:
-        data[variable] = xr.open_zarr(store(variable))[variable]
+        ds = open_store(resolve(df, variable)[0])
+        if not ds.time.equals(data.time):
+            raise RuntimeError(
+                f"{variable}: time axis does not match {VARIABLES[0]} "
+                f"({ds.time.size} steps, {ds.time.values[0]} to {ds.time.values[-1]} "
+                f"vs {data.time.size} steps, {data.time.values[0]} to "
+                f"{data.time.values[-1]})")
+        if ds[variable].sizes.get("nlat") != data.sizes["nlat"] \
+                or ds[variable].sizes.get("nlon") != data.sizes["nlon"]:
+            raise RuntimeError(f"{variable}: horizontal shape does not match {VARIABLES[0]}")
+        data[variable] = ds[variable]
+
+    if data.sizes["nlat"] != area.sizes["y"] or data.sizes["nlon"] != area.sizes["x"]:
+        raise RuntimeError("the areacello grid does not match the data grid: "
+                           f"{(area.sizes['y'], area.sizes['x'])} vs "
+                           f"{(data.sizes['nlat'], data.sizes['nlon'])}")
+    if data.time.size < N_MONTHS:
+        raise RuntimeError(f"{EXPERIMENT} has {data.time.size} months, "
+                           f"fewer than the {N_MONTHS} this script asks for")
+
     data = data.rename({"nlat": "y", "nlon": "x"})
-    data = data.drop_vars(["time_bnds", "lat_bnds", "lon_bnds"])
+    data = data.drop_vars(["time_bnds", "lat_bnds", "lon_bnds"], errors="ignore")
 
     data = data.assign_coords(
         wetmask=(["lev", "y", "x"], ((data["so"][0] * data["thetao"][0]) * 0 + 1).values))
@@ -157,7 +244,6 @@ def vertical_operator(data):
 
 
 def process_block(data, start, end, grid, deltas, new_dz, new_levels, thk_bnds, thk_centers):
-    """Vertically then horizontally regrid one block of time steps."""
     ds = data.isel(time=slice(start, end))
     ds = ds.chunk({"time": 1, "y": ds.y.size, "x": ds.x.size})
     ds = ds.assign_coords(thk_bnds=thk_bnds.transpose("lev", "y", "x"))
@@ -187,15 +273,12 @@ def process_block(data, start, end, grid, deltas, new_dz, new_levels, thk_bnds, 
 
 
 def init_store(data, example):
-    """Allocate the output store so the time blocks can be written as regions."""
     template = xr.Dataset(coords=example.coords)
     template["time"] = data.time
     for variable in set(example.variables) - set(example.coords.variables):
         shape = example[variable].shape
         if "time" in example[variable].dims:
             shape = (data.time.size,) + shape[1:]
-        # Chunking comes from the explicit `.chunk()` below, and `to_zarr(compute=False)`
-        # writes metadata only, so these zeros are never materialised.
         template[variable] = xr.DataArray(
             dask.array.zeros(shape), dims=example[variable].dims)
 
@@ -214,6 +297,10 @@ def init_store(data, example):
 
 
 def main():
+    if sys.argv[1] == "catalog":
+        print_catalog()
+        return
+
     data = load_source()
     grid = load_target_grid()
     data, deltas, new_dz, new_levels, thk_bnds, thk_centers = vertical_operator(data)
